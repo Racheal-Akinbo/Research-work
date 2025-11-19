@@ -1,1 +1,620 @@
+!python -m pip install --upgrade pip
+!pip install opencv-python imbalanced-learn xgboost
+!pip install matplotlib
+!pip install seaborn
+!pip install matplotlib seaborn
+!pip install tqdm
+!pip install shap
+!pip install psutil
 
+import os
+import cv2
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+import seaborn as sns
+import time
+import xgboost as xgb
+
+from sklearn.model_selection import train_test_split, GridSearchCV, RandomizedSearchCV
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.decomposition import PCA
+
+from sklearn.metrics import (
+    classification_report, confusion_matrix, accuracy_score,
+    precision_score, recall_score, f1_score, roc_auc_score,
+    roc_curve, precision_recall_curve, auc, average_precision_score 
+)
+
+from imblearn.over_sampling import SMOTE
+from xgboost import XGBClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.svm import SVC
+
+import joblib
+import shap
+
+# Set precision
+pd.set_option('display.float_format', '{:.4f}'.format)
+np.set_printoptions(precision=4, suppress=True)
+
+
+def load_images_from_folder(folder_path, img_size=(250, 250)):
+    images, labels = [], []
+    class_names = os.listdir(folder_path)
+    for class_name in class_names:
+        class_folder = os.path.join(folder_path, class_name)
+        if not os.path.isdir(class_folder): continue
+        for filename in tqdm(os.listdir(class_folder), desc=f"Loading {class_name}"):
+            img_path = os.path.join(class_folder, filename)
+            try:
+                img = cv2.imread(img_path)
+                if img is not None:
+                    img = cv2.resize(img, img_size)
+                    img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                    images.append(img)
+                    labels.append(class_name)
+            except Exception as e:
+                print(f"Error loading {img_path}: {e}")
+    return np.array(images), np.array(labels)
+
+dataset_path = 'Sorted-Set'
+X, y = load_images_from_folder(dataset_path)
+
+X_flat = X.reshape(len(X), -1)
+
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X_flat)
+
+encoder = LabelEncoder()
+y_encoded = encoder.fit_transform(y)
+
+# Print label mapping
+label_mapping = dict(zip(encoder.classes_, encoder.transform(encoder.classes_)))
+print("\n🔖 Label Encoding Mapping:")
+for label, idx in label_mapping.items():
+    print(f"{label} → {idx}")
+
+X_temp, X_val, y_temp, y_val = train_test_split(X_scaled, y_encoded, test_size=0.10, random_state=42, stratify=y_encoded)
+X_train, X_test, y_train, y_test = train_test_split(X_temp, y_temp, test_size=2/9, random_state=42, stratify=y_temp)
+
+smote = SMOTE(random_state=42)
+X_train_smote, y_train_smote = smote.fit_resample(X_train, y_train)
+
+# Example: Balance to 5000 samples per class
+from smote_custom_balance import custom_smote_balance
+X_train_smote, y_train_smote = custom_smote_balance(X_train, y_train, target_samples_per_class=5100)
+
+unique, counts = np.unique(y_train_smote, return_counts=True)
+plt.figure(figsize=(10, 5))
+sns.barplot(x=encoder.inverse_transform(unique), y=counts)
+plt.title("Class Distribution After SMOTE")
+plt.xticks(rotation=45)
+plt.tight_layout()
+plt.show()
+
+pca = PCA(n_components=250)
+X_train_pca = pca.fit_transform(X_train_smote)
+X_test_pca = pca.transform(X_test)
+X_val_pca = pca.transform(X_val)
+
+# train svm
+import psutil
+initial_memory = psutil.Process().memory_info().rss / 1024 / 1024
+start_time = time.time()
+
+svm_model = SVC(kernel='rbf', C=10, gamma='scale', probability=True)
+
+start_train = time.time()
+svm_model.fit(X_train_pca, y_train_smote)
+end_train = time.time()
+
+final_memory = psutil.Process().memory_info().rss / 1024 / 1024
+training_time = time.time() - start_time
+memory_used = final_memory - initial_memory
+
+print(f"Training Time: {training_time:.2f} seconds")
+print(f"Memory Used: {memory_used:.2f} MB")
+
+start_test = time.time()
+y_pred_test = svm_model.predict(X_test_pca)
+y_pred_val = svm_model.predict(X_val_pca)
+end_test = time.time()
+
+print("\n📊 Classification Report - Test Set:")
+print(classification_report(y_test, y_pred_test, digits=4, target_names=encoder.classes_))
+
+print("\n📊 Classification Report - Validation Set:")
+print(classification_report(y_val, y_pred_val, digits=4, target_names=encoder.classes_))
+
+#joblib.dump(svm_model, 'svm_modeln.pkl')
+print("✅ Model saved as svm_modeln.pkl")
+
+cm = confusion_matrix(y_val, y_pred_val)
+plt.figure(figsize=(8, 6))
+sns.heatmap(cm, annot=True, fmt='d', cmap='YlOrBr',
+            xticklabels=encoder.classes_, yticklabels=encoder.classes_, vmin=0, vmax=500)
+plt.title("Confusion Matrix - Validation Set")
+plt.xlabel("Predicted")
+plt.ylabel("Actual")
+plt.tight_layout()
+plt.show()
+
+cm = confusion_matrix(y_test, y_pred_test)
+plt.figure(figsize=(8, 6))
+sns.heatmap(cm, annot=True, fmt='d', cmap='YlOrBr',
+            xticklabels=encoder.classes_, yticklabels=encoder.classes_, vmin=0, vmax=500)
+plt.title("Confusion Matrix - Testingi Set")
+plt.xlabel("Predicted")
+plt.ylabel("Actual")
+plt.tight_layout()
+plt.show()
+
+train_time = end_train - start_train
+test_time = end_test - start_test
+print(f"\n⏱️ Time Taken:")
+print(f"Training Time: {train_time:.2f} seconds")
+print(f"Testing Time: {test_time:.2f} seconds")
+
+# Get probability predictions for ROC curve
+y_pred_proba_svm = svm_model.predict_proba(X_test_pca)[:, 1]
+fpr_svm, tpr_svm, _ = roc_curve(y_test, y_pred_proba_svm)
+roc_auc_svm = auc(fpr_svm, tpr_svm)
+
+plt.figure(figsize=(8, 6))
+plt.plot(fpr_svm, tpr_svm, color='darkorange', lw=2, label=f'SVM ROC (AUC = {roc_auc_svm:.4f})')
+plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate')
+plt.title('SVM - ROC Curve')
+plt.legend()
+plt.grid()
+plt.show()
+
+precision_svm, recall_svm, _ = precision_recall_curve(y_test, y_pred_proba_svm)
+avg_precision_svm = average_precision_score(y_test, y_pred_proba_svm)
+
+plt.figure(figsize=(8, 6))
+plt.plot(recall_svm, precision_svm, lw=2, color='blue', label=f'SVM AP = {avg_precision_svm:.4f}')
+plt.xlabel('Recall')
+plt.ylabel('Precision')
+plt.title('SVM - Precision-Recall Curve')
+plt.legend()
+plt.grid()
+plt.show()
+
+# Step 11: Set up Random Forest and hyperparameter grid
+param_grid = {
+    'n_estimators': [100, 200],
+    'max_depth': [10, 20],
+    'min_samples_split': [2, 5],
+    'min_samples_leaf': [1, 2],
+    'bootstrap': [True]
+}
+
+rf = RandomForestClassifier(random_state=42)
+grid_search = GridSearchCV(rf, param_grid, cv=3, n_jobs=-1, verbose=2, scoring='accuracy')
+
+import psutil
+initial_memory = psutil.Process().memory_info().rss / 1024 / 1024
+start_time = time.time()
+
+print("\n🔧 Starting training...")
+start_train = time.time()
+grid_search.fit(X_train_pca, y_train_smote)
+end_train = time.time()
+
+final_memory = psutil.Process().memory_info().rss / 1024 / 1024
+training_time = time.time() - start_time
+memory_used = initial_memory - final_memory
+
+print(f"Training Time: {training_time:.2f} seconds")
+print(f"Memory Used: {memory_used:.2f} MB")
+
+best_rf = grid_search.best_estimator_
+print(f"\n✅ Best Parameters: {grid_search.best_params_}")
+
+start_test = time.time()
+y_test_pred = best_rf.predict(X_test_pca)
+y_val_pred = best_rf.predict(X_val_pca)
+end_test = time.time()
+
+print("\n📊 Test Set Classification Report:")
+print(classification_report(y_test, y_test_pred, digits=4, target_names=encoder.classes_))
+
+print("\n📊 Validation Set Classification Report:")
+print(classification_report(y_val, y_val_pred, digits=4,  target_names=encoder.classes_))
+
+#joblib.dump(best_rf, 'rf_model.pkl')
+print("✅ Model saved as rf_model.pkl")
+
+cm = confusion_matrix(y_val, y_val_pred)
+plt.figure(figsize=(8, 6))
+sns.heatmap(cm, annot=True, fmt='d', cmap='Oranges',
+            xticklabels=encoder.classes_, yticklabels=encoder.classes_, vmin=0, vmax=500)
+plt.title("Confusion Matrix - Validation")
+plt.xlabel("Predicted")
+plt.ylabel("Actual")
+plt.tight_layout()
+plt.show()
+
+print(f"\n⏱️ Time Taken:")
+print(f"Training Time: {end_train - start_train:.2f} seconds")
+print(f"Testing Time: {end_test - start_test:.2f} seconds")
+
+y_pred_proba_rf = best_rf.predict_proba(X_test_pca)[:, 1]
+fpr_rf, tpr_rf, _ = roc_curve(y_test, y_pred_proba_rf)
+roc_auc_rf = auc(fpr_rf, tpr_rf)
+
+plt.figure(figsize=(8, 6))
+plt.plot(fpr_rf, tpr_rf, color='green', lw=2, label=f'RF ROC (AUC = {roc_auc_rf:.4f})')
+plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate')
+plt.title('Random Forest - ROC Curve')
+plt.legend()
+plt.grid()
+plt.show()
+
+precision_rf, recall_rf, _ = precision_recall_curve(y_test, y_pred_proba_rf)
+avg_precision_rf = average_precision_score(y_test, y_pred_proba_rf)
+
+plt.figure(figsize=(8, 6))
+plt.plot(recall_rf, precision_rf, lw=2, color='green', label=f'RF AP = {avg_precision_rf:.4f}')
+plt.xlabel('Recall')
+plt.ylabel('Precision')
+plt.title('Random Forest - Precision-Recall Curve')
+plt.legend()
+plt.grid()
+plt.show()
+
+param_grid = {
+    'C': [0.01, 0.1, 1, 10],                      # Regularization strength
+    'penalty': ['l2'],                            # L2 regularization
+    'solver': ['lbfgs', 'saga'],                  # Solvers that support L2
+    'max_iter': [1000]
+}
+
+log_reg = LogisticRegression(random_state=42)
+grid_search = GridSearchCV(log_reg, param_grid, cv=5, scoring='accuracy', n_jobs=-1, verbose=1)
+
+import psutil
+initial_memory = psutil.Process().memory_info().rss / 1024 / 1024
+start_time = time.time()
+
+start_train = time.time()
+grid_search.fit(X_train_pca, y_train_smote)
+end_train = time.time()
+
+best_model = grid_search.best_estimator_
+print("\n✅ Best Parameters Found:", grid_search.best_params_)
+
+final_memory = psutil.Process().memory_info().rss / 1024 / 1024
+training_time = time.time() - start_time
+memory_used = final_memory - initial_memory
+
+print(f"Training Time: {training_time:.2f} seconds")
+print(f"Memory Used: {memory_used:.2f} MB")
+
+start_test = time.time()
+y_pred_test = best_model.predict(X_test_pca)
+y_pred_val = best_model.predict(X_val_pca)
+end_test = time.time()
+
+print("\n📊 Classification Report - Test Set:")
+print(classification_report(y_test, y_pred_test, digits=4, target_names=encoder.classes_))
+
+print("\n📊 Classification Report - Validation Set:")
+print(classification_report(y_val, y_pred_val, digits=4, target_names=encoder.classes_))
+
+joblib.dump(best_model, 'lr_model.pkl')
+print("✅ Model saved as lr_model.pkl")
+
+cm = confusion_matrix(y_val, y_pred_val)
+plt.figure(figsize=(8, 6))
+sns.heatmap(cm, annot=True, fmt='d', cmap='YlOrBr',
+            xticklabels=encoder.classes_, yticklabels=encoder.classes_, vmin=0, vmax=500)
+plt.title("Confusion Matrix - Validation Set")
+plt.xlabel("Predicted")
+plt.ylabel("Actual")
+plt.tight_layout()
+plt.show()
+
+train_time = end_train - start_train
+test_time = end_test - start_test
+print(f"\n⏱️ Time Taken:")
+print(f"Training Time: {train_time:.2f} seconds")
+print(f"Testing Time: {test_time:.2f} seconds")
+
+y_pred_proba_lr = best_model.predict_proba(X_test_pca)[:, 1]
+fpr_lr, tpr_lr, _ = roc_curve(y_test, y_pred_proba_lr)
+roc_auc_lr = auc(fpr_lr, tpr_lr)
+
+plt.figure(figsize=(8, 6))
+plt.plot(fpr_lr, tpr_lr, color='red', lw=2, label=f'LR ROC (AUC = {roc_auc_lr:.4f})')
+plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate')
+plt.title('Logistic Regression - ROC Curve')
+plt.legend()
+plt.grid()
+plt.show()
+
+precision_lr, recall_lr, _ = precision_recall_curve(y_test, y_pred_proba_lr)
+avg_precision_lr = average_precision_score(y_test, y_pred_proba_lr)
+
+plt.figure(figsize=(8, 6))
+plt.plot(recall_lr, precision_lr, lw=2, color='red', label=f'LR AP = {avg_precision_lr:.4f}')
+plt.xlabel('Recall')
+plt.ylabel('Precision')
+plt.title('Logistic Regression - Precision-Recall Curve')
+plt.legend()
+plt.grid()
+plt.show()
+
+
+import psutil
+initial_memory = psutil.Process().memory_info().rss / 1024 / 1024
+start_time = time.time()
+
+
+dtrain = xgb.DMatrix(X_train_pca, label=y_train_smote)
+dtest = xgb.DMatrix(X_test_pca, label=y_test)
+dval = xgb.DMatrix(X_val_pca, label=y_val)
+
+#  Build XGBoost model with tuned hyperparameters
+num_classes = len(np.unique(y_encoded))
+params = {
+    'objective': 'multi:softmax',
+    'eval_metric': 'mlogloss',
+    'num_class': num_classes,
+    'learning_rate': 0.05,
+    'max_depth': 6,
+    'subsample': 0.8,
+    'colsample_bytree': 0.8,
+    'seed': 42
+}
+
+# Train model with eval_set for early stopping
+start_train = time.time()
+model = xgb.train(
+    params,
+    dtrain,
+    num_boost_round=300,
+    evals=[(dval, "Validation")],
+    early_stopping_rounds=10,
+    verbose_eval=10
+)
+end_train = time.time()
+
+
+#  Predict and evaluate on test and validation sets
+start_test = time.time()
+y_pred_test = model.predict(dtest)
+y_pred_val = model.predict(dval)
+end_test = time.time()
+
+
+final_memory = psutil.Process().memory_info().rss / 1024 / 1024
+training_time = time.time() - start_time
+memory_used = final_memory - initial_memory
+
+print(f"Training Time: {training_time:.2f} seconds")
+print(f"Memory Used: {memory_used:.2f} MB")
+
+
+# Evaluation report
+import pandas as pd
+pd.set_option('display.float_format', '{:.4f}'.format)
+
+print("\nClassification Report - Test Set:")
+print(classification_report(y_test, y_pred_test, digits=4,  target_names=encoder.classes_))
+
+print("\nClassification Report - Validation Set:")
+print(classification_report(y_val, y_pred_val, digits=4,  target_names=encoder.classes_))
+
+
+
+xgb_model = XGBClassifier()
+xgb_model.fit(X_train, y_train)
+joblib.dump(xgb_model, 'xgb_model.pkl')
+
+print("✅ Model saved as xgb_model.pkl")
+
+
+cm = confusion_matrix(y_val, y_pred_val)
+plt.figure(figsize=(8, 6))
+sns.heatmap(cm, annot=True, fmt='d', cmap='YlOrBr',
+            xticklabels=encoder.classes_, yticklabels=encoder.classes_, vmin=0, vmax=500)
+plt.title("Confusion Matrix - Validation")
+plt.xlabel("Predicted")
+plt.ylabel("True")
+plt.tight_layout()
+plt.show()
+
+
+
+train_time = end_train - start_train
+test_time = end_test - start_test
+print(f"\nTime Taken:")
+print(f"Training Time: {train_time:.2f} seconds")
+print(f"Testing Time: {test_time:.2f} seconds")
+
+
+y_pred_proba_xgb = model.predict(dtest, output_margin=False)
+if len(y_pred_proba_xgb.shape) > 1:
+    y_pred_proba_xgb = y_pred_proba_xgb[:, 1]
+
+fpr_xgb, tpr_xgb, _ = roc_curve(y_test, y_pred_proba_xgb)
+roc_auc_xgb = auc(fpr_xgb, tpr_xgb)
+
+plt.figure(figsize=(8, 6))
+plt.plot(fpr_xgb, tpr_xgb, color='purple', lw=2, label=f'XGB ROC (AUC = {roc_auc_xgb:.4f})')
+plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate')
+plt.title('XGBoost - ROC Curve')
+plt.legend()
+plt.grid()
+plt.show()
+
+precision_xgb, recall_xgb, _ = precision_recall_curve(y_test, y_pred_proba_xgb)
+avg_precision_xgb = average_precision_score(y_test, y_pred_proba_xgb)
+
+plt.figure(figsize=(8, 6))
+plt.plot(recall_xgb, precision_xgb, lw=2, color='purple', label=f'XGB AP = {avg_precision_xgb:.4f}')
+plt.xlabel('Recall')
+plt.ylabel('Precision')
+plt.title('XGBoost - Precision-Recall Curve')
+plt.legend()
+plt.grid()
+plt.show()
+
+
+
+
+import psutil
+import time
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+def get_memory_usage():
+    """Get current memory usage in MB"""
+    process = psutil.Process()
+    memory_info = process.memory_info()
+    return memory_info.rss / 1024 / 1024
+
+# Create comparison table
+print("📊 COMPREHENSIVE MODEL COMPARISON TABLE")
+print("="*100)
+
+# Assuming you have all models trained, create comparison table
+comparison_data = []
+
+# SVM Results (replace with your actual results)
+svm_memory = 48.88  # Current memory after SVM training
+svm_time = 74.67  # Your actual training time
+svm_accuracy = 0.9000  # Your actual accuracy
+svm_roc_auc = 0.9624  # Calculate from your ROC curve
+
+comparison_data.append({
+    'Model': 'SVM',
+    'Training Time (s)': svm_time,
+    'Memory Used (MB)': svm_memory,
+    'Accuracy': svm_accuracy,
+    'ROC AUC': svm_roc_auc
+})
+
+# Random Forest Results
+rf_time = 271.61  # Your actual training time
+rf_accuracy = 0.8524  # Your actual accuracy
+rf_roc_auc = 0.9466  # Calculate from your ROC curve
+rf_memory = -499.48
+
+comparison_data.append({
+    'Model': 'Random Forest',
+    'Training Time (s)': rf_time,
+    'Memory Used (MB)': rf_memory,
+    'Accuracy': rf_accuracy,
+    'ROC AUC': rf_roc_auc
+})
+
+# Logistic Regression Results
+lr_time = 166.50  # Your actual training time
+lr_accuracy = 0.8208  # Your actual accuracy
+lr_roc_auc = 0.9001  # Calculate from your ROC curve
+lr_memory = -90.95
+
+comparison_data.append({
+    'Model': 'Logistic Regression',
+    'Training Time (s)': lr_time,
+    'Memory Used (MB)': lr_memory,
+    'Accuracy': lr_accuracy,
+    'ROC AUC': lr_roc_auc
+})
+
+# XGBoost Results
+xgb_time = 30.71  # Your actual training time
+xgb_accuracy = 0.8930  # Your actual accuracy
+xgb_roc_auc = 0.8930  # Calculate from your ROC curve
+xgb_memory = 67.37
+
+comparison_data.append({
+    'Model': 'XGBoost',
+    'Training Time (s)': xgb_time,
+    'Memory Used (MB)': xgb_memory,
+    'Accuracy': xgb_accuracy,
+    'ROC AUC': xgb_roc_auc
+})
+
+# Create DataFrame
+df_comparison = pd.DataFrame(comparison_data)
+
+# Display table
+pd.set_option('display.float_format', '{:.4f}'.format)
+print(df_comparison.to_string(index=False))
+
+# Create visualizations
+fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+fig.suptitle('Model Comparison Analysis', fontsize=16, fontweight='bold')
+
+colors = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4']
+
+# Training Time
+axes[0, 0].bar(df_comparison['Model'], df_comparison['Training Time (s)'], color=colors)
+axes[0, 0].set_title('Training Time Comparison', fontweight='bold')
+axes[0, 0].set_ylabel('Time (seconds)')
+axes[0, 0].tick_params(axis='x', rotation=45)
+
+
+# Memory Usage
+axes[0, 1].bar(df_comparison['Model'], df_comparison['Memory Used (MB)'], color=colors)
+axes[0, 1].set_title('Memory Usage Comparison', fontweight='bold')
+axes[0, 1].set_ylabel('Memory (MB)')
+axes[0, 1].tick_params(axis='x', rotation=45)
+axes[0, 1].set_ylim(-550.0, 100.0)
+
+# Accuracy
+axes[1, 0].bar(df_comparison['Model'], df_comparison['Accuracy'], color=colors)
+axes[1, 0].set_title('Accuracy Comparison', fontweight='bold')
+axes[1, 0].set_ylabel('Accuracy')
+axes[1, 0].tick_params(axis='x', rotation=45)
+axes[1, 0].set_ylim(0.7500, 0.9500)
+
+# ROC AUC
+axes[1, 1].bar(df_comparison['Model'], df_comparison['ROC AUC'], color=colors)
+axes[1, 1].set_title('ROC AUC Comparison', fontweight='bold')
+axes[1, 1].set_ylabel('ROC AUC')
+axes[1, 1].tick_params(axis='x', rotation=45)
+axes[1, 1].set_ylim(0.7500, 1.0000)
+
+plt.tight_layout()
+plt.show()
+
+# Show rankings
+print("\n🏆 MODEL RANKINGS")
+print("="*60)
+
+df_rankings = df_comparison.copy()
+df_rankings['Time Rank'] = df_rankings['Training Time (s)'].rank(ascending=True)
+df_rankings['Memory Rank'] = df_rankings['Memory Used (MB)'].rank(ascending=True)
+df_rankings['Accuracy Rank'] = df_rankings['Accuracy'].rank(ascending=False)
+df_rankings['ROC AUC Rank'] = df_rankings['ROC AUC'].rank(ascending=False)
+
+df_rankings['Overall Score'] = (
+    df_rankings['Time Rank'] + 
+    df_rankings['Memory Rank'] + 
+    df_rankings['Accuracy Rank'] + 
+    df_rankings['ROC AUC Rank']
+)
+df_rankings['Overall Rank'] = df_rankings['Overall Score'].rank(ascending=True)
+
+ranking_cols = ['Model', 'Overall Rank', 'Time Rank', 'Memory Rank', 'Accuracy Rank', 'ROC AUC Rank']
+print(df_rankings[ranking_cols].sort_values('Overall Rank').to_string(index=False))
+
+best_model = df_rankings.loc[df_rankings['Overall Rank'].idxmin(), 'Model']
+print(f"\n🥇 BEST OVERALL MODEL: {best_model}")
